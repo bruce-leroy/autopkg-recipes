@@ -3,13 +3,13 @@
 <plist version="1.0">
     <dict>
         <key>Description</key>
-        <string>Downloads latest VLC disk image, and builds a package, and uploads to the JSS.</string>
+        <string>Downloads latest Mactracker disk image, and builds a package, and uploads to the JSS.</string>
         <key>Identifier</key>
-        <string>com.github.autopkg.jss.VLC</string>
+        <string>com.github.bruce-leroy.autopkg-recipes.Mactraker.jss</string>
         <key>Input</key>
         <dict>
             <key>NAME</key>
-            <string>VLC</string>
+            <string>Mactracker</string>
             <key>CATEGORY</key>
             <string>Media Plugins and Viewers</string>
             <key>POLICY_CATEGORY</key>
