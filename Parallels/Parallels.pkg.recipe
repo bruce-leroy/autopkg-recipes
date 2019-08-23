@@ -3,51 +3,27 @@
 <plist version="1.0">
 <dict>
 	<key>Description</key>
-	<string>Downloads latest Endnote X9 installer and uses it to create a package.</string>
+	<string>Downloads latest Parallels installer and uses it to create a package.</string>
 	<key>Identifier</key>
-	<string>com.github.bruce-leroy.pkg.EndNoteX9</string>
+	<string>com.github.bruce-leroy.pkg.parallels</string>
 	<key>Input</key>
 	<dict>
 		<key>NAME</key>
-		<string>EndNoteX9</string>
+		<string>Parallels</string>
+		<key>REC_HOME</key>
+		<string>%RECIPE_REPO_DIR%/com.github.bruce-leroy.autopkg-recipes/%NAME%</string>
 	</dict>
 	<key>MinimumVersion</key>
 	<string>1.0.0</string>
 	<key>ParentRecipe</key>
-	<string>com.github.bruce-leroy.download.EndNoteX9</string>
+	<string>com.github.homebysix.download.ParallelsDesktop</string>
 	<key>Process</key>
 	<array>
 		<dict>
 			<key>Arguments</key>
 			<dict>
-				<key>source_path</key>
-				<string>%pathname%/Install EndNote X9.app/Contents/Resources/EndNote.zip</string>
-				<key>destination_path</key>
-				<string>%RECIPE_CACHE_DIR%/EndNote.zip</string>
-				<key>purge_destination</key>
-				<true/>
-			</dict>
-			<key>Processor</key>
-			<string>Copier</string>
-		</dict>
-		<dict>
-			<key>Arguments</key>
-			<dict>
-				<key>archive_path</key>
-				<string>%RECIPE_CACHE_DIR%/EndNote.zip</string>
-				<key>destination_path</key>
-				<string>%RECIPE_CACHE_DIR%/unarchive</string>
-				<key>purge_destination</key>
-				<true/>
-			</dict>
-			<key>Processor</key>
-			<string>Unarchiver</string>
-		</dict>
-		<dict>
-			<key>Arguments</key>
-			<dict>
 				<key>input_plist_path</key>
-				<string>%RECIPE_CACHE_DIR%/unarchive/EndNote/EndNote X9.app/Contents/Info.plist</string>
+				<string>%pathname%/Install.app/Contents/Info.plist</string>
 				<key>plist_version_key</key>
 				<string>CFBundleShortVersionString</string>
 			</dict>
@@ -59,10 +35,8 @@
 			<dict>
 				<key>pkgdirs</key>
 				<dict>
-					<key>Applications</key>
+					<key>private/tmp/parallels</key>
 					<string>0775</string>
-					<key>Library</key>
-					
 				</dict>
 				<key>pkgroot</key>
 				<string>%RECIPE_CACHE_DIR%/pkgroot</string>
@@ -74,9 +48,20 @@
 			<key>Arguments</key>
 			<dict>
 				<key>destination_path</key>
-				<string>%RECIPE_CACHE_DIR%/pkgroot/Applications/EndNote X9</string>
+				<string>%RECIPE_CACHE_DIR%/pkgroot/private/tmp/parallels/Parallels Desktop Autodeploy.pkg</string>
 				<key>source_path</key>
-				<string>%RECIPE_CACHE_DIR%/unarchive/EndNote</string>
+				<string>%REC_HOME%/payload/Parallels Desktop Autodeploy.pkg</string>
+			</dict>
+			<key>Processor</key>
+			<string>Copier</string>
+		</dict>
+		<dict>
+			<key>Arguments</key>
+			<dict>
+				<key>destination_path</key>
+				<string>%RECIPE_CACHE_DIR%/pkgroot/private/tmp/parallels/Parallels Desktop Autodeploy.pkg/Parallels Desktop DMG/</string>
+				<key>source_path</key>
+				<string>%RECIPE_CACHE_DIR%/downloads/Parallels-14.dmg</string>
 			</dict>
 			<key>Processor</key>
 			<string>Copier</string>
@@ -86,21 +71,10 @@
 			<dict>
 				<key>pkg_request</key>
 				<dict>
-					<key>chown</key>
-					<array>
-						<dict>
-							<key>group</key>
-							<string>admin</string>
-							<key>path</key>
-							<string>Applications</string>
-							<key>user</key>
-							<string>root</string>
-						</dict>
-					</array>
 					<key>id</key>
-					<string>com.endnote.EndNoteX9.pkg</string>
+					<string>com.parallels.pkg</string>
 					<key>pkgname</key>
-					<string>EndNoteX9-%version%</string>
+					<string>Parallels-%version%</string>
 					<key>pkgroot</key>
 					<string>%RECIPE_CACHE_DIR%/pkgroot</string>
 					<key>pkgtype</key>
@@ -108,7 +82,7 @@
 					<key>version</key>
 					<string>%version%</string>
 					<key>scripts</key>
-                    <string>scripts</string>
+                	<string>scripts</string>
 				</dict>
 			</dict>
 			<key>Processor</key>
@@ -121,12 +95,11 @@
 			<dict>
 				<key>path_list</key>
 				<array>
-					<string>%RECIPE_CACHE_DIR%/EndNote.zip</string>
-					<string>%RECIPE_CACHE_DIR%/unarchive</string>
 					<string>%RECIPE_CACHE_DIR%/pkgroot</string>
 				</array>
 			</dict>
 		</dict>
+
 	</array>
 </dict>
 </plist>

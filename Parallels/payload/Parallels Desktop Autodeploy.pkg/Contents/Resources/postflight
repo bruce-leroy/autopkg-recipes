@@ -1,0 +1,1524 @@
+#! /bin/bash
+
+################################################################
+#
+# Parallels Desktop Unnatended Deployment Script
+# http://www.parallels.com
+#
+################################################################
+
+# NOTE : all these 'set' options must be inherited by subshell
+set -o nounset # Treat unset variables as an error when substituting.
+set -o pipefail # pipeline ret val is the status of the last non-zero exit status command
+
+# Trap ERR and exit in main shell and subshells (ERR trap is set to be inherited).
+# EXIT trap is not inherited bu subhells, so main shell is the only place where do 'cleanup',
+# subshells will only exit on ERR.
+set -o errtrace
+trap exit ERR
+trap OnExit EXIT
+
+#
+# Declare variables
+#
+
+# Currenly logged in console user
+console_user=""
+
+# Getting package root path.
+# Root path is given as $1 argument with bundle's path.
+readonly root_path="$1"
+
+# Package configuration
+readonly config_file_dir="${root_path}/License Key and Configuration"
+readonly config_file="${config_file_dir}/deploy.cfg"
+
+# Parallels Desktop install image location
+readonly pd_dmg_dir="${root_path}/Parallels Desktop DMG"
+
+# VM(s) to be deployed location
+readonly vms_dir="${root_path}/Virtual Machine(s)"
+
+# Guest app stubs to be deployed location
+readonly app_stubs_dir="${root_path}/Windows Application(s) stubs to add to Dock"
+
+# Single app mode VM keyb&mouse profile
+readonly vm_sam_keyb_profile="WindowsSingleAppMode"
+readonly vm_sam_keyb_profile_file="${root_path}/Contents/Resources/${vm_sam_keyb_profile}.dat"
+
+readonly SBA_INSTALL_PATH="/Applications/Parallels Desktop.app"
+readonly LAUNCHD_SETUP_REL_PATH="Contents/MacOS/launchd_setup"
+readonly LAUNCHD_SETUP="${SBA_INSTALL_PATH}/${LAUNCHD_SETUP_REL_PATH}"
+readonly LAUNCHER="${SBA_INSTALL_PATH}/Contents/MacOS/launcher"
+readonly PRL_SERVICE_RUNNER="${SBA_INSTALL_PATH}/Contents/MacOS/Parallels Service"
+readonly PRLCTL_SBA_PATH="${SBA_INSTALL_PATH}/Contents/MacOS/prlctl"
+PRLCTL="prlctl"
+readonly PRLSRVCTL_SBA_PATH="${SBA_INSTALL_PATH}/Contents/MacOS/prlsrvctl"
+PRLSRVCTL="prlsrvctl"
+
+#
+KEXTS_LOADING_IS_BLOCKED_BY_OSX=0
+
+readonly LAUNCHD_PLIST=/Library/LaunchDaemons/com.parallels.desktop.launchdaemon.plist
+
+# Parallels Desktop application prefs domain
+readonly parallels_desktop_domain="com.parallels.Parallels Desktop"
+
+# License related variables
+readonly license_file_dir="${config_file_dir}"
+license_key=""
+readonly license_offline_confirmation_file="${license_file_dir}/pdfm_confirmation_code.txt"
+license_offline_confirmation_id=""
+
+# External VMs list
+VMs=()
+
+# Runtime params and flags
+app_dmg_mountpoint=""
+check_final_services_start_mode=0
+need_update_license=0
+need_enable_custom_pwd=0
+first_registered_vm_uuid=""
+
+#
+# Declare functions
+#
+
+# Autodeployment logger.
+# Log can be found at: /var/log/install.log
+Log() {
+	# Do not return any error from here
+	logger -p install.info -t 'Parallels Autodeployment' "$@" || true
+} &>/dev/null
+
+OnExit() {
+	local -r err=$?
+	[ $err -ne 0 ] || return 0 # return success if no error
+
+	UnmountInstallerDmg || true
+
+	UpdateLicense || true
+
+	prlsrvctl_enable_require_password_to_options || true
+
+	final_services_restart || true
+
+	Log "Error $err, Backtrace "$(get_backtrace)""
+	return $err
+}
+
+Abort() {
+	Log "Error : $@"
+	exit 1
+}
+
+ get_backtrace() {
+	local -r depth=${#FUNCNAME[@]}
+	for ((i=1; i<$depth; i++)); do
+		local func="${FUNCNAME[$i]}"
+		local line="${BASH_LINENO[$((i-1))]}"
+		echo "<- line $line: $func()"
+	done
+}
+
+get_console_user() {
+	[ ! -e /dev/console ] || stat -f%Su /dev/console
+}
+
+# Host users list
+get_host_users() {
+	dscl . list /Users | grep -v "^_"
+}
+
+get_pd_version() {
+	local -r bundle="${1:-${SBA_INSTALL_PATH}}"
+	local -r info_plist="${bundle}/Contents/Info.plist"
+
+	local ver
+	# NOTE : vesrion 7 - is pre-SBA version
+	ver=`defaults read "${info_plist}" CFMajorVersion 2>/dev/null` || ver=7
+	echo "${ver}"
+}
+
+CheckUser() {
+	Log "User : id '$(id -un)', whoami '$(whoami)'"
+
+	# Get console user
+	console_user="$(get_console_user)"
+	Log "Current console user '$console_user'"
+
+	# Must be running as root
+	[[ $(id -u) == 0 ]] || \
+		Abort "Must be running as root"
+}
+
+CheckPackage() {
+	[ -e "${root_path}" ] || \
+		Abort "Package root path $root_path doesn't exist"
+
+	Log "Package root path: ${root_path}"
+
+	Log "Package $(cat "${root_path}/Contents/Resources/version" | tr '\n' ' ')"
+}
+
+CheckConfigFile() {
+	[ -e "${config_file}" ] || \
+		Abort "Can't find config file ${config_file}"
+
+	validate_config
+}
+
+GetLicense() {
+	license_key="$(get_cfg_var license_key)"
+
+	[ -n "${license_key}" ] || \
+		Abort "No license key found."
+
+	Log "License key found"
+
+	read_license_offline_confirmation
+}
+
+get_real_path() {
+	local -r path="$1"
+	python -c "import os; print(os.path.realpath('$path'))"
+}
+
+get_vmname() {
+	echo "${VMs[$1]%%:*}"
+}
+get_vmpath() {
+	echo "${VMs[$1]##*:}"
+}
+
+get_cfg_var() {
+	local -r var_name="$1"
+
+	local line;
+	local value
+
+	line="$(cat "$config_file" | grep "^[[:space:]]*$var_name[[:space:]]*=")" &&
+	value="$(echo "$line" | awk -F= '{print $2}')" &&
+	# TextEdit inserts typographyc quotes, replace it with "
+	value="$( export LC_ALL=C; echo "${value}" | sed -e $"s/“/\"/g" -e $"s/”/\"/g" )" &&
+	# leading quote and all symbols after last quote
+	echo ${value} | sed -e 's/^"//'  -e 's/".*$//'
+}
+
+get_vm_list_from_cfg() {
+	VMs=()
+
+	local lines; lines=`cat "$config_file" | grep "^ *[^# *]\(\"*.*.pvm\"*\) *="` || return 0
+	local line
+	while read -r line; do
+		local cleared_line; cleared_line="$(echo $line | sed -e "s/#.*$//;")"
+
+		local name; name="$(echo $cleared_line  | sed -e "s/^[[:space:]]*\(.*\)[[:space:]]*=.*$/\1/;" \
+												| sed -e "s/[[:space:]]*$//;  s/\"\(.*\)\"/\1/; s/'\(.*\)'/\1/;")"
+
+		local value; value="$(echo $cleared_line | sed -e "s/^.*=[[:space:]]*\(.*\)[[:space:]]*$/\1/;" \
+												| sed -e "s/[[:space:]]*$//;  s/\"\(.*\)\"/\1/; s/'\(.*\)'/\1/;")"
+
+		VMs+=("${name}":"${value}")
+	done < <(echo "${lines}")
+}
+
+fill_vm_list_from_cfg() {
+	# Get vm list and store it in VMs array
+	get_vm_list_from_cfg
+
+	# Check VMs existanse
+	local idx
+	local vmname
+	for idx in ${!VMs[*]}; do
+		vmname="$(get_vmname $idx)"
+		[ -d "${vms_dir}/${vmname}" ] || \
+			Abort "Parallels VM '${vmname}' was not found"
+	done
+
+	Log "${#VMs[@]} VMs to deploy found"
+}
+
+get_vm_custom_path() {
+	local -r name="$1"
+	local custom_path
+	local idx
+ 	for idx in ${!VMs[*]}; do
+		[[ "x$name" == "x$(get_vmname $idx)" ]] || continue
+		custom_path="$(get_vmpath $idx)"
+		break
+	done
+	[ -n "${custom_path}" ] &&
+		echo "${custom_path}"
+}
+
+is_enable_single_application_mode() {
+	local enable_sam; enable_sam="$(get_cfg_var enable_single_application_mode)"
+	[[ "x$enable_sam" == "xyes" ]]
+}
+
+read_license_offline_confirmation() {
+	[ -e "$license_offline_confirmation_file" ] || return 0 # no file
+	Log "License offline confirmation file ${license_offline_confirmation_file} found."
+
+	[ -r "${license_offline_confirmation_file}" ] || \
+		Abort "License offline confirmation file ${license_offline_confirmation_file} is not accessable."
+
+	license_offline_confirmation_id=$( sed -n 1p "${license_offline_confirmation_file}" )
+}
+
+validate_parameter() {
+	local -r MANDATORY=$((1<<0))
+	local -r SECURED=$((1<<1))
+	local -r name="$1"
+	local -r flags=${2:-0}
+	local -r match=${3:-}
+	local -r not_match=${4:-}
+
+	local value;
+	if ! value="$(get_cfg_var "$name")" ; then
+		[ $(($flags & $MANDATORY)) -eq 0 ] || \
+			Abort "Configuration error: '$name' mandatory variable is not set"
+		return 0
+	fi
+	readonly value
+
+	if [[ $(($flags & $SECURED)) -ne 0 ]]; then
+		Log "Configuration : '$name' variable is set"
+	else
+		Log "Configuration : '$name' variable is set to '$value'"
+	fi
+
+	[ -z "$match" ] || echo "$value" | grep -q -E "$match" || \
+		Abort "Configuration error: '$name' value '$value' is incorrect"
+
+	[ -z "$not_match" ] || ! echo "$value" | grep -q -E "$not_match" || \
+		Abort "Configuration error: '$1' value '$value' is incorrect"
+}
+
+validate_config() {
+	local -r OPTIONAL=0
+	local -r MANDATORY=$((1<<0))
+	local -r SECURED=$((1<<1))
+
+	validate_parameter "license_key" $(($MANDATORY | $SECURED)) "\w+-\w+-\w+-\w+-\w+" "XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX"
+
+	validate_parameter "vm_register_mode" $MANDATORY "(Private|Shared)"
+
+	validate_parameter "vm_deploy_mode" $MANDATORY "(Copy|Move)"
+	validate_parameter "vm_reset_hwid" $MANDATORY "(yes|no)"
+
+	validate_parameter "vm_destination_folder" $OPTIONAL ".*"
+
+	validate_parameter "updates_url" $OPTIONAL "(http[s]?://.*|None|Parallels)"
+	validate_parameter "updates_auto_check" $OPTIONAL "(0|1|2|3)"
+	validate_parameter "updates_auto_download" $OPTIONAL "(on|off)"
+	
+	validate_parameter "support_url" $OPTIONAL "(http[s]?://.*|^$)"
+	validate_parameter "lic_admin_url" $OPTIONAL "(http[s]?://.*|^$)"
+	
+	validate_parameter "cep_participation" $OPTIONAL "(off|on)"
+	validate_parameter "cep_skip_participation_request" $OPTIONAL
+	
+	validate_parameter "start_pd_as_service" $OPTIONAL "(yes|no)"
+	validate_parameter "report_allow_screenshots" $OPTIONAL "(yes|no)"
+
+	validate_parameter "control_center_banner_url" $OPTIONAL "(http[s]?://.*|file:///.*|^$)"
+	validate_parameter "control_center_banner_height" $OPTIONAL "^[0-9]+$"
+	validate_parameter "control_center_banner_min_width" $OPTIONAL "^[0-9]+$"
+
+	validate_parameter "password_to_edit_prefs" $OPTIONAL "(on|off)"
+	validate_parameter "password_to_create_vm" $OPTIONAL "(on|off)"
+	validate_parameter "password_to_add_vm" $OPTIONAL "(on|off)"
+	validate_parameter "password_to_remove_vm" $OPTIONAL "(on|off)"
+	validate_parameter "password_to_clone_vm" $OPTIONAL "(on|off)"
+
+	validate_parameter "admin_password_to_create_vm" $OPTIONAL "(on|off)"
+	validate_parameter "admin_password_to_add_vm" $OPTIONAL "(on|off)"
+	validate_parameter "admin_password_to_remove_vm" $OPTIONAL "(on|off)"
+	validate_parameter "admin_password_to_clone_vm" $OPTIONAL "(on|off)"
+
+	validate_parameter "vm_password_to_edit" $(($OPTIONAL | $SECURED))
+
+	validate_parameter "hide_license_request_params" $OPTIONAL "(on|off)"
+
+	validate_parameter "enable_single_application_mode" $OPTIONAL "(yes|no)"
+
+	validate_parameter "show_developers_menu" $OPTIONAL "(yes|no)"
+}
+
+find_prl_ctl_tools() {
+	[ -f "$PRLCTL_SBA_PATH" ] && PRLCTL="$PRLCTL_SBA_PATH"
+	[ -f "$PRLSRVCTL_SBA_PATH" ] && PRLSRVCTL="$PRLSRVCTL_SBA_PATH"
+
+	return 0
+}
+
+gen_new_vm_uuid() {
+	echo "{$(uuidgen | tr "[:upper:]" "[:lower:]")}"
+}
+
+prlctl_has_option() {
+	local -r option_name="$1"
+	[ -n "$option_name" ] &&
+		"${PRLCTL}" --help 2>/dev/null | grep -e "$option_name" 1>/dev/null 2>&1
+}
+
+prlsrvctl_has_option() {
+	local -r option_name="$1"
+	[ -n "$option_name" ] &&
+		"${PRLSRVCTL}" --help 2>/dev/null | grep -e "$option_name" 1>/dev/null 2>&1
+}
+
+prlctl_set() {
+	local -r user="$1"
+	local -r vm_name="$2"
+	local err_output
+	shift 2
+	err_output="$(sudo -u "${user}" "${PRLCTL}" set "${vm_name}" "$@" 2>&1-)" || \
+		Abort "Failed to set VM '${vm_name}' option(s) '$@': ${err_output}"
+} &>/dev/null
+
+prlsrvctl_set() {
+	local err_output
+	err_output="$("${PRLSRVCTL}" set "$@" 2>&1-)" || \
+		Abort "Failed to set Srv option(s) '$@': ${err_output}"
+} &>/dev/null
+
+get_prlctl_vm_home() {
+	local -r user="$1"
+	local -r vm_uuid="$2"
+
+	# List VM info and grep "Home:" line, remove "Home: " from this line - now you have VM home
+	[ -n "$vm_uuid" ] && \
+		sudo -u "${user}" "${PRLCTL}" list "${vm_uuid}" -i | grep -e "^Home:.*$" | cut -c7-
+}
+
+prlctl_apply_vm_option() {
+	local -r user="$1"
+	local -r vm_name="$2"
+	local -r prlctl_option_name="$3"
+	local prlctl_option_value=""
+	local -r cfg_option_name="$4"
+
+	local cfg_option_value; cfg_option_value="$(get_cfg_var "${cfg_option_name}")" || return 0 # nothing to apply
+	readonly cfg_option_value
+
+	case "${cfg_option_value}" in
+		"yes") prlctl_option_value=on ;;
+		"on") prlctl_option_value=on ;;
+		"no") prlctl_option_value=off ;;
+		"off") prlctl_option_value=off ;;
+		*) Abort "Incorrect value for '${cfg_option_name}' : '${cfg_option_value}'" ;;
+	esac
+
+	prlctl_set "${user}" "${vm_name}" "${prlctl_option_name}" "${prlctl_option_value}"
+}
+
+get_prlctl_preserve_uuid_opt() {
+	IFS='.' read -a ver <<< "$("${PRLCTL}" --version | awk '{print $3}')"
+	if [[ "${ver[0]}" -lt "8" ]]; then
+		echo "--preserve-uuid yes"
+	else
+		echo "--preserve-uuid"
+	fi
+}
+
+get_prlctl_regenerate_src_uuid_opt() {
+	local vm_reset_hwid; vm_reset_hwid="$(get_cfg_var vm_reset_hwid)"
+	[[ "x"$vm_reset_hwid == "xyes" ]] && \
+		prlctl_has_option "--regenerate-src-uuid" && \
+			echo "--regenerate-src-uuid"
+}
+
+get_prlsrvctl_user_vm_home() {
+	local -r user="$1"
+	[ -n "$user" ] && \
+		sudo -u "${user}" "${PRLSRVCTL}" info | grep -e "^VM home:.*$" | cut -c10-
+}
+
+get_prlsrvctl_activate_online_opt() {
+	prlsrvctl_has_option "install-license.*--activate-online-immediately" && \
+		echo "--activate-online-immediately"
+}
+
+prlsrvctl_apply_screenshots_option() {
+	local report_allow_screenshots; report_allow_screenshots="$(get_cfg_var report_allow_screenshots)" || return 0 # nothing to apply
+
+	if ! prlsrvctl_has_option "--allow-attach-screenshots"; then
+		Log "Warning: --allow-attach-screenshots is not available"
+		return 0 # not an error
+	fi
+
+	local val=""
+	case $report_allow_screenshots in
+		"yes") val=on ;;
+		"no") val=off ;;
+		*) Abort "Incorrect value for report_allow_screenshots: $report_allow_screenshots" ;;
+	esac
+
+	prlsrvctl_set --allow-attach-screenshots $val
+}
+
+prlsrvctl_apply_cep_participation_option() {
+	local cep_participation; cep_participation="$(get_cfg_var cep_participation)" || return 0 # nothing to apply
+
+	case "${cep_participation}" in
+		"on") ;;
+		"off") ;;
+		*) Abort "Incorrect cep_participation value ${cep_participation}" ;;
+	esac
+
+	Log "Update CEP participation to ${cep_participation}"
+	prlsrvctl_set --cep ${cep_participation}
+}
+
+prlsrvctl_apply_single_application_mode_options() {
+	is_enable_single_application_mode || return 0
+
+	prlsrvctl_set --external-dev-auto-connect "host"
+}
+
+prlsrvctl_hide_license_request_params() {
+	local value; value="$(get_cfg_var hide_license_request_params)" || return 0 # nothing to apply
+
+	Log "Hide some params in license request"
+	if ! prlsrvctl_has_option "--hide-license-request-params"; then
+		Log "Warning: --hide-license-request-params is not available"
+		return 0 # not an error
+	fi
+
+	prlsrvctl_set --hide-license-request-params "${value}"
+}
+
+prlsrvctl_disable_require_password_to_options() {
+	local value; value="$(get_cfg_var current_password)" || return 0 # nothing to apply
+
+	Log "Disable require custom password"
+	echo "$value" | prlsrvctl_set --custom-pwd --custom-pwd-mode off
+
+	need_enable_custom_pwd=1
+}
+
+prlsrvctl_enable_require_password_to_options() {
+	[ $need_enable_custom_pwd -eq 1 ] || return 0
+
+	need_enable_custom_pwd=0
+
+	local value; value="$(get_cfg_var current_password)" || return 0 # nothing to apply
+
+	Log "Enable require custom password"
+	printf "%s\n%s\n" "${value}" "${value}" | prlsrvctl_set --custom-pwd --custom-pwd-mode on
+}
+
+prlsrvctl_apply_require_password_to_options() {
+	local args=""
+	local value=""
+
+	value="$(get_cfg_var password_to_edit_prefs)" && args="$args --require-custom-pwd edit-preferences:$value " || true
+
+	value="$(get_cfg_var password_to_create_vm)" && args="$args --require-custom-pwd create-vm:$value " || true
+
+	value="$(get_cfg_var password_to_add_vm)" && args="$args --require-custom-pwd add-vm:$value " || true
+
+	value="$(get_cfg_var password_to_remove_vm)" && args="$args --require-custom-pwd remove-vm:$value " || true
+
+	value="$(get_cfg_var password_to_clone_vm)" && args="$args --require-custom-pwd clone-vm:$value " || true
+
+	if [[ -n "$args" ]]; then
+		Log "Update require custom password options to $args"
+		prlsrvctl_set $args
+	fi
+
+	if value="$(get_cfg_var new_password)"; then
+		Log "Set require custom password"
+		printf "%s\n%s\n" "${value}" "${value}" | prlsrvctl_set --custom-pwd --custom-pwd-mode on
+		need_enable_custom_pwd=0
+	fi
+}
+
+prlsrvctl_apply_require_admin_password_to_options() {
+	local args=""
+	local value=""
+
+	value="$(get_cfg_var admin_password_to_create_vm)" && args="$args --require-pwd create-vm:$value " || true
+
+	value="$(get_cfg_var admin_password_to_add_vm)" && args="$args --require-pwd add-vm:$value " || true
+
+	value="$(get_cfg_var admin_password_to_remove_vm)" && args="$args --require-pwd remove-vm:$value " || true
+
+	value="$(get_cfg_var admin_password_to_clone_vm)" && args="$args --require-pwd clone-vm:$value " || true
+
+	if [[ -n "$args" ]]; then
+		Log "Update require admin password options to $args"
+		prlsrvctl_set $args
+	fi
+}
+
+change_updates_url() {
+	local updates_url; updates_url="$(get_cfg_var updates_url)" || return 0 # nothing to apply
+
+	local -r user="$1"
+	local -r prefs_path="$2"
+	sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" \
+		"Application preferences.VolumeLicenseUpdatePolicy" "$updates_url"
+}
+
+protect_settings_from_reset() {
+	local -r user="$1"
+	local -r prefs_path="$2"
+	sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" \
+		"Application preferences.Old application preferences resetted" -bool "true"
+}
+
+change_auto_check_for_updates() {
+	local updates_auto_check; updates_auto_check="$(get_cfg_var updates_auto_check)" || return 0 # nothing to apply
+
+	case "${updates_auto_check}" in
+		[0-3] ) ;;
+		*) Abort "Incorrect updates_auto_check value $updates_auto_check" ;;
+	esac
+
+	local -r user="$1"
+	local -r prefs_path="$2"
+	Log "Set auto updates check to ${updates_auto_check} for ${user}"
+	sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" \
+		"Application preferences.Check for updates" -int "${updates_auto_check}"
+}
+
+change_auto_download_updates() {
+	local updates_auto_download; updates_auto_download="$(get_cfg_var updates_auto_download)" || return 0 # nothing to apply
+
+	local value=""
+	case "${updates_auto_download}" in
+		"on") value="true" ;;
+		"off") value="false" ;;
+		*) Abort "Incorrect updates_auto_download value $updates_auto_download" ;;
+	esac
+
+	local -r user="$1"
+	local -r prefs_path="$2"
+
+	Log "Set auto download updates to ${value} for ${user}"
+	sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" \
+		"Application preferences.Download updates automatically" -bool "${value}"
+}
+
+change_support_url() {
+	local support_url; support_url="$(get_cfg_var support_url)" || return 0 # nothing to apply
+
+	local -r user="$1"
+	local -r prefs_path="$2"
+	if [[ "x${support_url}" == "x" ]]; then
+		sudo -u "${user}" defaults delete "${prefs_path}${parallels_desktop_domain}" "SupportRequestUrl"
+	else
+		sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" "SupportRequestUrl" "$support_url"
+	fi
+}
+
+change_lic_admin_url() {
+	local lic_admin_url; lic_admin_url="$(get_cfg_var lic_admin_url)" || return 0 # nothing to apply
+
+	local -r user="$1"
+	local -r prefs_path="$2"
+	if [[ "x${lic_admin_url}" == "x" ]]; then
+		sudo -u "${user}" defaults delete "${prefs_path}${parallels_desktop_domain}" "ActivationProblemContactUrl"
+	else
+		sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" "ActivationProblemContactUrl" "$lic_admin_url"
+	fi
+}
+
+change_cep_request() {
+	local skip_cep_request # "yes" is default
+	skip_cep_request="$(get_cfg_var cep_skip_participation_request)" || skip_cep_request="yes"
+
+	local -r user="$1"
+	local -r prefs_path="$2"
+
+	local value=""
+	case "${skip_cep_request}" in
+		"no") value="false" ;;
+		"yes") value="true" ;;
+		*) Abort "Incorrect cep_skip_participation_request value $skip_cep_request" ;;
+	esac
+
+	sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" "ForceDisableCepQuestion" "$value"
+}
+
+change_control_center_banner() {
+	local control_center_banner_url; control_center_banner_url="$(get_cfg_var control_center_banner_url)" || return 0 # nothing to apply
+
+	local -r user="$1"
+	local -r prefs_path="$2"
+
+	if [[ "x${control_center_banner_url}" == "x" ]]; then
+		sudo -u "${user}" defaults delete "${prefs_path}${parallels_desktop_domain}" \
+					"ControlCenterBannerURL"
+		sudo -u "${user}" defaults delete "${prefs_path}${parallels_desktop_domain}" \
+					"ControlCenterBannerHeight"
+		sudo -u "${user}" defaults delete "${prefs_path}${parallels_desktop_domain}" \
+					"ControlCenterBannerWidth"
+		return 0
+	fi
+
+	sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" \
+		"ControlCenterBannerURL" "$control_center_banner_url"
+
+	local control_center_banner_height; control_center_banner_height="$(get_cfg_var control_center_banner_height)" \
+		&& sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" \
+			"ControlCenterBannerHeight" -int "$control_center_banner_height" \
+			|| true
+
+	local control_center_banner_min_width; control_center_banner_min_width="$(get_cfg_var control_center_banner_min_width)" \
+		&& sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" \
+			"ControlCenterBannerWidth" -int "$control_center_banner_min_width" \
+			|| true
+}
+
+change_developers_menu_visibility() {
+	# set this option via prlctl, if supported
+	! prlctl_has_option "--show-dev-tools" || return 0
+
+	local show_developers_menu; show_developers_menu="$(get_cfg_var show_developers_menu)" || return 0 # nothing to apply
+
+	# set this option via application settings
+	local -r user="$1"
+	local -r prefs_path="$2"
+
+	local value=""
+	case "${show_developers_menu}" in
+		"yes") value="1" ;;
+		"no") value="0" ;;
+		*) Abort "Incorrect show_developers_menu value $show_developers_menu" ;;
+	esac
+
+	sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" "Application preferences.Show Develop Menu" -int "$value"
+}
+
+is_launchd_setup_exists() {
+	# Note: this kind of launchd logic is supported since PD9
+
+	local -r bundle="${1}"
+	local -r launchd_setup="${bundle}/${LAUNCHD_SETUP_REL_PATH}"
+
+	[ -n "${bundle}" ] &&
+		[ -f "${launchd_setup}" ]
+}
+
+MountInstallerDmg() {
+	# Getting Parallels Desktop Installation image path.
+	local -r dmg_file=$( ls "${pd_dmg_dir}" 2>/dev/null | grep -m 1 .dmg)
+	[ -n "${dmg_file}" ] || \
+		Abort "No Installation image found"
+
+	local -r dmg_path="${pd_dmg_dir}/${dmg_file}"
+
+	Log "Installation image found: ${dmg_path}"
+
+	[ -z "$app_dmg_mountpoint" ] || \
+		Abort "Installation image is already mounted '${app_dmg_mountpoint}'"
+	
+	# Making temporary directory and writing to log if failed.
+	app_dmg_mountpoint="$(mktemp -d -t dmg-mountpoint-XXXXXX 2>/dev/null)" || \
+		Abort "Cannot create temporary directory for Installation image"
+
+	# Mounting image to either newly created mountpoint
+	# or default location in case of "No mountable FS found".
+	if ! hdiutil attach "${dmg_path}" -mountpoint "${app_dmg_mountpoint}" -private -nobrowse >/dev/null 2>&1; then
+		Log "Cannot mount Installation image to custom mount point '${app_dmg_mountpoint}'. Using default."
+		hdiutil attach "${dmg_path}" >/dev/null 2>&1
+
+		local -r pd_partition=`ls /Volumes/ | grep "Parallels Desktop" 2>/dev/null`
+		app_dmg_mountpoint="/Volumes/${pd_partition}"
+	fi
+	Log "Installation image mounted to: ${app_dmg_mountpoint}"
+
+}
+
+UnmountInstallerDmg() {
+	[ -n "${app_dmg_mountpoint}" ] || return 0
+
+	Log "Unmounting Installation image '$app_dmg_mountpoint'"
+
+	hdiutil detach "${app_dmg_mountpoint}" >/dev/null 2>&1 ||
+		Log "Warning : failed to unmont Installation image '$app_dmg_mountpoint'"
+
+	app_dmg_mountpoint=""
+	Log "Installation image was unmounted"
+}
+
+InstallParallelsDesktop() {
+	[ -n "${app_dmg_mountpoint}" ] || \
+		Abort "Unable to install Parallels Desktop, no installation source mount point provided."
+
+	# Stop Parallels Desktop first, if running
+	StopParallelsDesktop
+
+	# Starting installation.
+	local installation_result=1
+	if [ -e "${app_dmg_mountpoint}/Parallels Desktop.app" ]; then
+		# Installation is performed using PD itself
+		Log "Installing Parallels Desktop"
+
+		local -r new_pd_ver="$(get_pd_version "${app_dmg_mountpoint}/Parallels Desktop.app")"
+
+		# If deployed PD version (old version) does not support services launch management scripts,
+		# use "-s" option of inittool to start services during app bundle initialization,
+		# otherwise services will be launched on the next step.
+		local start_service_param=""
+		[ $new_pd_ver -ge 9 ] || start_service_param="-s"
+
+		"${app_dmg_mountpoint}/Parallels Desktop.app/Contents/MacOS/inittool" install -t "${SBA_INSTALL_PATH}" "${start_service_param}"
+	else
+		# Installation is performed using Mac native installer.
+		Log "Installing using '${app_dmg_mountpoint}/Install.mpkg'"
+		installer -pkg "${app_dmg_mountpoint}/Install.mpkg" -target /
+	fi
+
+	check_final_services_start_mode=1
+
+	Log "Application installation completed"
+}
+
+InstallApplication() {
+	MountInstallerDmg
+
+	InstallParallelsDesktop
+
+	UnmountInstallerDmg
+}
+
+InstallLicense() {
+	local -r key="$1"
+	local -r confirmation_id="$2"
+
+	if ! "${PRLSRVCTL}" install-license -k "${key}" $(get_prlsrvctl_activate_online_opt); then
+		Log "Warning: unable to install license key."
+		if prlsrvctl_has_option "--deferred"; then
+			Log "Try to install license in deferred mode"
+			"${PRLSRVCTL}" install-license -k "${key}" --deferred || \
+				Log "Warning: unable to install license key in deferred mode."
+		fi
+	fi
+	
+	if [ -n "$confirmation_id" ]; then
+		"${PRLSRVCTL}" activate-license-offline --id "$confirmation_id" || \
+			Log "Warning: unable to confirm license offline."
+	fi
+
+	need_update_license=1
+}
+
+UpdateLicense() {
+	[ $need_update_license -eq 1 ] || return 0
+
+	need_update_license=0
+	Log "Trying to 'update' license"
+	"${PRLSRVCTL}" update-license || \
+		Log "Warning : Failed to 'update' license"
+}
+
+deploy_user_guest_app_stubs() {
+	local -r user="$1"
+	local -r vm_uuid="$2"
+	local -r vm_name="$3"
+
+	local home_path; home_path="$(dscacheutil -q user -a name "${user}" | grep dir | sed 's,^dir:\ ,,')"
+	readonly home_path
+
+	local restart_dock=""
+
+	# Make "Applications (Parallels)" dir if not exists and set proper permissions
+	local -r user_prl_apps_dir="${home_path}/Applications (Parallels)"
+	[ -e "${user_prl_apps_dir}" ] || sudo -u "$user" mkdir -m 0700 "$user_prl_apps_dir"
+
+	# Make VM specific subdir
+	# example : "{5970644e-b0e0-4c0c-bf24-1c1e4f6f92da} Applications.localized"
+	local -r vm_app_stubs_dir="${user_prl_apps_dir}/${vm_uuid} Applications.localized"
+	sudo -u "$user" mkdir "$vm_app_stubs_dir"
+
+	# Deploy app stub(s)
+	local app_file
+	while read -r app_file; do
+		# Copy stub(s) and set proper permissions
+		cp -R "${app_stubs_dir}/${app_file}" "${vm_app_stubs_dir}"
+		local app_stub="${vm_app_stubs_dir}/${app_file}"
+		chown -R "${user}" "$app_stub"
+		chmod -R 777 "$app_stub"
+
+		# Configure stub(s), set proper vm_uuid + vm_name
+		local app_stub_config="${app_stub}/Contents/Resources/AppParams.pva"
+		[ -e "${app_stub_config}" ]
+		sed -e "s/^VM Id = .*$/VM Id = ${vm_uuid}/g" -i "" "$app_stub_config"
+		sed -e "s/^VM Name = .*$/VM Name = ${vm_name}/g" -i "" "$app_stub_config"
+
+		# Add stubs to Dock
+		sudo -u "${user}" defaults write com.apple.dock persistent-apps -array-add "<dict><key>tile-data</key><dict><key>file-data</key><dict><key>_CFURLString</key><string>${app_stub}</string><key>_CFURLStringType</key><integer>0</integer></dict></dict></dict>"
+		restart_dock="yes"
+	done < <(ls -1 "${app_stubs_dir}" | grep .app)
+
+	# Restart Dock (for console_user only) if any app was added to Dock
+	if [ -n "$restart_dock" ] && [[ "x$user" == "x$console_user" ]]; then
+		sudo -u "${console_user}" /usr/bin/killall Dock >/dev/null 2>&1
+	fi
+}
+
+PutVM() {
+	local -r method="$1"
+	local -r src_path="$2"
+	local -r dst_path="$3"
+
+	Log "Processing ('$method') Parallels VM: ${src_path} -> ${dst_path}"
+
+	[ ! -e "${dst_path}" ] || \
+		Abort "Destination VM path '${dst_path}' already exists"
+
+	if [[ "x$method" == "xMove" ]]; then
+		mv -n "${src_path}" "${dst_path}"
+	else
+		if ! cp -Rn -c "${src_path}" "${dst_path}"; then
+			Log "Failed to clonefile VM to '${dst_path}', exit status $?"
+			cp -Rn "${src_path}" "${dst_path}"
+		fi
+	fi
+
+	Log "'$method' Parallels VM: ${src_path} -> ${dst_path} - succeeded"
+}
+
+set_vm_password_to_edit() {
+	local pwd; pwd="$(get_cfg_var vm_password_to_edit)" || return 0 # nothing to apply
+
+	Log "vm_password_to_edit variable is set"
+
+	local -r user="$1"
+	local -r vm_name="$2"
+
+	printf "%s\n%s\n" "${pwd}" "${pwd}" | prlctl_set "${user}" "${vm_name}" --password-to-edit
+}
+
+apply_vm_single_application_mode_options() {
+	is_enable_single_application_mode || return 0
+
+	# Check if single application mode is supported
+	prlctl_has_option "--show-guest-app-folder-in-dock" || \
+		Abort "Single application mode is not supported by this version of Parallels Desktop"
+
+	local -r user="$1"
+	local -r vm_name="$2"
+
+	prlctl_set "${user}" "${vm_name}" "--autostart" "user-login"
+	prlctl_set "${user}" "${vm_name}" "--startup-view" "coherence"
+	prlctl_set "${user}" "${vm_name}" "--pause-idle" "off"
+	prlctl_set "${user}" "${vm_name}" "--shf-guest" "off"
+	prlctl_set "${user}" "${vm_name}" "--show-guest-app-folder-in-dock" "off"
+	prlctl_set "${user}" "${vm_name}" "--winsystray-in-macmenu" "off"
+	prlctl_set "${user}" "${vm_name}" "--swipe-from-edges" "off"
+	prlctl_set "${user}" "${vm_name}" "--share-host-location" "off"
+
+	Log "Single application mode is succesfully configured for VM '"$vm_name"'"
+}
+
+assign_vm_single_application_mode_keyb_profile() {
+	is_enable_single_application_mode || return 0
+
+	local -r user="$1"
+	local -r vm_uuid="$2"
+
+	local home_path; home_path="$(dscacheutil -q user -a name "${user}" | grep dir | sed 's,^dir:\ ,,')"
+	readonly home_path
+
+	# Copy keyb profile file to user prefs dir
+	local -r profile_dir="${home_path}/Library/Preferences/Parallels"
+	[ -e "${profile_dir}" ] || sudo -u "$user" mkdir -p "${profile_dir}"
+	cp -f "${vm_sam_keyb_profile_file}" "${profile_dir}"
+
+	# Assing VM keyb profile (write to app prefs)
+	sudo -u "${user}" defaults write "${parallels_desktop_domain}" \
+		"User Preferences.Keyboard.Profile Assigns.$vm_uuid" "${vm_sam_keyb_profile}"
+}
+
+apply_vm_options() {
+	local -r user="$1"
+	local -r vm_name="$2"
+
+	apply_vm_single_application_mode_options "${user}" "${vm_name}" || \
+		Abort "Failed to apply VM '"$vm_name"' single application mode options"
+
+	! prlctl_has_option "--show-dev-tools" || \
+		prlctl_apply_vm_option "${user}" "${vm_name}" "--show-dev-tools" "show_developers_menu"
+
+	set_vm_password_to_edit "$user" "$vm_name"
+}
+
+DeployPrivateVM() {
+	local -r method="$1"
+	local -r user="$2"
+	local -r src_path="$3"
+	local -r dst_path="$4"
+
+	# Make sure destination directory exists and accessible for user
+	local -r base_path="${dst_path%/*}"
+	sudo -u "${user}" mkdir -p "${base_path}" || \
+		Abort "Directory '${base_path}' is not accessible or unable to create"
+
+	# Copy/Move VM to destination path
+	PutVM "${method}" "${src_path}" "${dst_path}"
+
+	# We are changing owner and group ! of VM and performing all manipulations using sudo command.
+	# This will prevent any errors during initial VM launch.
+
+	local group; group="$(id -g "${user}")" || \
+		Abort "Failed get user '${user}' group"
+	readonly group
+
+	chown -R "${user}:${group}" "${dst_path}" || \
+		Abort "Failed to change VM '${dst_path}' ownership"
+
+	# Register VM with specified uuid to be able 'find' this VM by this uuid after registration easily
+	local -r new_vm_uuid="$(gen_new_vm_uuid)"
+	# 'prlctl register' accepts uuid without brackets only
+	local -r new_vm_uuid_wo_brackets="$(echo ${new_vm_uuid} | tr -d '{}')"
+
+	sudo -u "${user}" "${PRLCTL}" register "${dst_path}" --uuid "$new_vm_uuid_wo_brackets" $(get_prlctl_regenerate_src_uuid_opt) 1>/dev/null
+	Log "Parallels VM '${dst_path}' was registered in VM directory with uuid '${new_vm_uuid}'."
+
+	# Save 1st registered VM uuid
+	[ -n "${first_registered_vm_uuid}" ] || first_registered_vm_uuid="${new_vm_uuid}"
+
+	# Update MAC address to solve possible address confilcts
+	prlctl_set "${user}" "$new_vm_uuid" --device-set "net0" --mac "auto"
+	Log "Parallels VM '${new_vm_uuid}' MAC address updated."
+
+	# Set VM new name (if same - nothing changed)
+	local -r new_vm_name="$(basename "${dst_path%%.pvm}")"
+	prlctl_set "${user}" "$new_vm_uuid" --name "$new_vm_name"
+	Log "Parallels VM '${new_vm_uuid}' name was set to '${new_vm_name}'"
+
+	# Apply/set per VM options/settings
+	apply_vm_options "${user}" "${new_vm_uuid}"
+
+	if [ "x${first_registered_vm_uuid}" = "x${new_vm_uuid}" ]; then
+		# Deploy guest app stub(s) for 1st registered VM only
+		deploy_user_guest_app_stubs "${user}" "$new_vm_uuid" "$new_vm_name"
+	fi
+
+	# Apply SingleAppMode settings
+	if is_enable_single_application_mode; then
+		# Assign to VM special for "single app mode" keyb&mouse profile
+		assign_vm_single_application_mode_keyb_profile "${user}" "$new_vm_uuid"
+
+		# Start 1st VM only (if kexts are not blocked)
+		if [ ${KEXTS_LOADING_IS_BLOCKED_BY_OSX} -eq 0 ] && \
+				[ "x${first_registered_vm_uuid}" = "x${new_vm_uuid}" ]; then
+			sudo -u "${user}" "${PRLCTL}" start "$new_vm_uuid" 1>/dev/null
+		fi
+	fi
+
+	echo "${new_vm_uuid}"
+}
+
+get_expand_home_path() {
+	local -r home_path="$1"
+	local -r dst_path="$2"
+
+   	echo "${dst_path}" | sed -e "s#^~#${home_path/\#/\\#}#"
+}
+
+DeployPrivateVMs() {
+	# Get deploy mode
+	local vm_deploy_mode; vm_deploy_mode="$(get_cfg_var vm_deploy_mode)" || \
+		Abort "vm_deploy_mode variable is not set"
+
+	local home_path=""
+	if [[ -n "${console_user}" ]]; then
+		home_path="$(dscacheutil -q user -a name "${console_user}" | grep dir | sed 's,^dir:\ ,,')"
+	else
+		home_path="$(echo ~)"
+	fi
+	readonly home_path
+
+	[ -e "$home_path" ] || \
+		Abort "Can't find user's home path \"$home_path\""
+
+	local vm_destination_dir="$(get_cfg_var vm_destination_folder)"
+	if [[ -n "${vm_destination_dir}" ]]; then
+		vm_destination_dir="$(get_expand_home_path "${home_path}" "$vm_destination_dir")"
+	else
+		# Get VM home path from user config, use default if no path in config
+		local vm_home_parallels_dir; vm_home_parallels_dir="$(get_prlsrvctl_user_vm_home "${console_user}")"
+		if [[ -z "${vm_home_parallels_dir}" ]]; then
+			# By default, path will be /Users/<username>/Parallels
+			vm_home_parallels_dir="${home_path}/Parallels"
+		fi
+		Log "Will use '${vm_home_parallels_dir}' as default vm home dir"
+		vm_destination_dir="${vm_home_parallels_dir}"
+	fi
+
+	# Searching for Parallels VMs, registering and setting owner.
+	# After VM registration, MAC address is updated using internal MAC generator.
+	Log "Searching for Parallels VMs in: ${vms_dir}"
+	local pvm_file
+	while read -r pvm_file; do
+		local src_pvm_path="${vms_dir}/${pvm_file}"
+		local dst_pvm_path="${vm_destination_dir}/${pvm_file}"
+
+		local custom_pvm_path="$(get_vm_custom_path "${pvm_file}")" || true
+		[ -z "${custom_pvm_path}" ] || dst_pvm_path="$(get_expand_home_path "$home_path" "${custom_pvm_path}")"
+
+		DeployPrivateVM "${vm_deploy_mode}" "${console_user}" "${src_pvm_path}" "${dst_pvm_path}" 1>/dev/null
+	done < <(ls -1 "${vms_dir}" | grep .pvm)
+}
+
+apply_user_single_application_mode_options() {
+	is_enable_single_application_mode || return 0
+
+	local -r user="$1"
+	local -r prefs_path="$2"
+
+	# Enable PD app "SingleAppMode" option
+	sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" "SingleAppMode" -bool YES
+
+	# Show PD icon in menu - disable
+	sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" "Application preferences.Show Tray Icon" -int 0
+
+	# VM Dock icons - disable
+	sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" "Application preferences.Dock icon" -int 2
+
+	# Check for updates - disable
+	sudo -u "${user}" defaults write "${prefs_path}${parallels_desktop_domain}" "Application preferences.Check for updates" -int 0
+}
+
+apply_any_user_options() {
+	local -r user="$1"
+	local -r prefs_path=${2:-}
+
+	apply_user_single_application_mode_options "$user" "$prefs_path"
+
+	protect_settings_from_reset "$user" "$prefs_path"
+	change_updates_url "$user" "$prefs_path"
+	change_auto_check_for_updates "$user" "$prefs_path"
+	change_auto_download_updates "$user" "$prefs_path"
+
+	change_support_url "$user" "$prefs_path"
+
+	change_cep_request "$user" "$prefs_path"
+
+	change_control_center_banner "$user" "$prefs_path"
+
+	change_lic_admin_url "$user" "$prefs_path"
+
+	change_developers_menu_visibility "$user" "$prefs_path"
+}
+
+apply_console_user_options() {
+	apply_any_user_options "${console_user}"
+}
+
+apply_user_options() {
+	local -r user="$1"
+	apply_any_user_options "${user}"
+}
+
+apply_template_user_options() {
+	local -r prefs_path="$1"
+	apply_any_user_options "root" "${prefs_path}"
+}
+
+apply_per_user_options() {
+	local rc=0
+
+	local user
+	while read -r user; do
+		[ -e "/Users/${user}" ] || continue
+
+		if [ "x${user}" = "x${console_user}" ]; then
+			apply_console_user_options || rc=1
+		else
+			apply_user_options "$user" || rc=1
+		fi
+	done < <(get_host_users)
+
+	local template
+	for template in "/System/Library/User Template"/*; do
+		apply_template_user_options "${template}/Library/Preferences/" || rc=1
+	done
+
+	return $rc
+}
+
+DeploySharedVM() {
+	local -r method="$1"
+	local -r src_path="$2"
+	local dst_path="$3"
+
+	# We allow to deploy Shared VM(s) only to "/Users/Shared/Parallels" subdirs
+	local -r users_shared_dir="/Users/Shared"
+	local -r prl_shared_vm_dir="${users_shared_dir}/Parallels"
+
+	# Check that Users Shared dir exists
+	[ -d "${users_shared_dir}" ] || \
+		Abort "Users Shared directory '${users_shared_dir}' does not exist"
+
+	# Get real absolute path
+	local real_prl_path; real_prl_path="$(get_real_path "${prl_shared_vm_dir}")"
+	local real_dst_path; real_dst_path="$(get_real_path "${prl_shared_vm_dir}/${dst_path}")"
+
+	[ -n "${real_prl_path}" ] && [ -n "${real_dst_path}" ] || \
+		Abort "Failed to ger real path for '${prl_shared_vm_dir}/${dst_path}'"
+
+	# Check that destination path is relative to "/Users/Shared/Parallels"
+	[[ "${real_dst_path}/" == "${real_prl_path}"/* ]] || \
+		Abort "Destination path '${prl_shared_vm_dir}/${dst_path}' for shared VM must be relative to '${prl_shared_vm_dir}'"
+
+	# Save real destination path
+	readonly dst_path="${real_dst_path}"
+
+	# Make sure destination directory exists
+	# NOTE : do not change dir access perm if it exists.
+	local -r base_path="${dst_path%/*}"
+	[ -d "${base_path}" ] || mkdir -p -m 777 "${base_path}" || \
+		Abort "Failed to create destination directory '${base_path}'"
+
+	# Copy/Move VM to destination path
+	PutVM "${method}" "${src_path}" "${dst_path}"
+
+	# Set owner to root initially
+	# During VM registration owner will be set to registering to user
+	chown -R root:wheel "${dst_path}" || \
+		Abort "Failed to change Shared VM ${dst_path} owner to root"
+
+	# VM is Shared, so make access for other/group same as user has,
+	# so all VM files as for owner and other have same access
+	chmod -R go=u "${dst_path}" || \
+		Abort "Failed to change Shared VM ${dst_path} permissions"
+
+	# Getting list of all users on the system and registering VM.
+	local first_user=""
+	local new_vm_uuid=""
+	local new_vm_uuid_wo_brackets=""
+	local new_vm_name=""
+	local new_vm_home=""
+	local user
+
+	while read -r user; do
+		[ -e "/Users/${user}" ] || continue
+
+		if [ -z ${first_user} ]; then
+			first_user=${user}
+			# For first user we should register VM with new UUID, generate
+			# unique MAC and then proceed to registration with preserving uuid.
+
+			# Register VM with specified uuid to be able 'find' this VM by this uuid after registration easily
+			new_vm_uuid="$(gen_new_vm_uuid)"
+			# 'prlctl register' accepts uuid without brackets only
+			new_vm_uuid_wo_brackets="$(echo ${new_vm_uuid} | tr -d '{}')"
+
+			sudo -u "${user}" "${PRLCTL}" register "${dst_path}" --uuid "$new_vm_uuid_wo_brackets" $(get_prlctl_regenerate_src_uuid_opt) 1>/dev/null
+			Log "Parallels VM '${dst_path}' was registered for '${user}' in VM directory with uuid '${new_vm_uuid}'."
+
+			# Save 1st registered VM uuid
+			[ -n "${first_registered_vm_uuid}" ] || first_registered_vm_uuid="${new_vm_uuid}"
+
+			# Update MAC address to solve possible address confilcts
+			prlctl_set "${user}" "$new_vm_uuid" --device-set "net0" --mac "auto"
+			Log "Parallels VM '${new_vm_uuid}' MAC address updated."
+
+			# Set VM new name (if same - nothing changed)
+			new_vm_name="$(basename "${dst_path%%.pvm}")"
+			prlctl_set "${user}" "$new_vm_uuid" --name "$new_vm_name"
+			Log "Parallels VM '${new_vm_uuid}' name was set to '${new_vm_name}'"
+
+			# Get VM home path (location)
+			new_vm_home="$(get_prlctl_vm_home "${user}" "${new_vm_uuid}")"
+			Log "Parallels VM '${new_vm_uuid}' home path '${new_vm_home}'"
+
+			# Apply/set per VM options/settings
+			apply_vm_options "${user}" "${new_vm_uuid}"
+		else
+			sudo -u ${user} "${PRLCTL}" register "${new_vm_home}" $(get_prlctl_preserve_uuid_opt) 1>/dev/null
+			Log "Parallels VM '${new_vm_name}' was registered for '${user}'."
+		fi
+
+		if [ "x${first_registered_vm_uuid}" = "x${new_vm_uuid}" ]; then
+			# Deploy guest app stub(s) for 1st registered VM only
+			deploy_user_guest_app_stubs "${user}" "$new_vm_uuid" "$new_vm_name"
+		fi
+
+		# Apply SingleAppMode settings (per user)
+		if is_enable_single_application_mode; then
+			# Assign to VM special for "single app mode" keyb&mouse profile
+			assign_vm_single_application_mode_keyb_profile "${user}" "$new_vm_uuid"
+		fi
+	done < <(get_host_users)
+
+	# Apply SingleAppMode settings
+	if is_enable_single_application_mode; then
+		# Start 1st VM for console user only (if kexts are not blocked)
+		if [ ${KEXTS_LOADING_IS_BLOCKED_BY_OSX} -eq 0 ] && \
+				[ "x${first_registered_vm_uuid}" = "x${new_vm_uuid}" ] && [ -n "${console_user}" ]; then
+			sudo -u "${console_user}" "${PRLCTL}" start "$new_vm_uuid" 1>/dev/null
+		fi
+	fi
+
+	echo "${new_vm_uuid}"
+}
+
+DeploySharedVMs() {
+	# Get deploy mode
+	local vm_deploy_mode; vm_deploy_mode="$(get_cfg_var vm_deploy_mode)" || \
+		Abort "vm_deploy_mode variable is not set"
+
+	# Preparing path for Shared VM storing.
+	local vm_destination_dir="$(get_cfg_var vm_destination_folder)"
+	if [[ -z "${vm_destination_dir}" ]]; then
+		vm_destination_dir="." # default relative path
+	fi
+
+	# Searching for Parallels VMs, registering and setting permissions.
+	# After VM registration, MAC address is updated using internal MAC generator.
+	Log "Searching for Parallels VMs in: ${vms_dir}"
+	local pvm_file
+	while read -r pvm_file; do
+		local src_pvm_path="${vms_dir}/${pvm_file}"
+		local dst_pvm_path="${vm_destination_dir}/${pvm_file}"
+
+		local custom_pvm_path="$(get_vm_custom_path "${pvm_file}")" || true
+		[ -z "${custom_pvm_path}" ] || dst_pvm_path="${custom_pvm_path}"
+
+		DeploySharedVM "$vm_deploy_mode" "${src_pvm_path}" "${dst_pvm_path}" 1>/dev/null
+	done < <(ls -1 "${vms_dir}" | grep .pvm)
+}
+
+DeployVMs() {
+	local vm_register_mode; vm_register_mode="$(get_cfg_var vm_register_mode)" || \
+		Abort "vm_register_mode variable is not set"
+
+	case "$vm_register_mode" in
+		"Private") DeployPrivateVMs ;;
+		"Shared") DeploySharedVMs ;;
+		*)
+			Abort "Unknown vm mode '$vm_register_mode'"
+		;;
+	esac
+}
+
+StopParallelsDesktop() {
+	if ! pgrep -x prl_client_app 1>/dev/null 2>&1; then
+		Log "Parallels Desktop is not running"
+		return 0
+	fi
+
+	Log "Stopping Parallels Desktop ..."
+	osascript -e 'tell application "Parallels Desktop" to quit'
+	local i
+	for i in $(seq 1 25); do
+		if ! pgrep -x prl_client_app 1>/dev/null 2>&1; then
+			Log "Parallels Desktop was stopped"
+			return 0
+		fi
+
+		sleep 2
+	done
+
+	Abort "Failed to stop Parallels Desktop"
+}
+
+DoLauncherOp() {
+
+	if [[ -n "$console_user" ]]; then
+		sudo -H -u "$console_user" "$LAUNCHER" "${1}" # run as 'console user'
+	else
+		"$LAUNCHER" "${1}"
+	fi
+}
+
+StartServices() {
+	local -r pd_ver="$(get_pd_version)"
+
+	local srv_start_rc=0
+
+	# Start services as NON-launchd mode, to be able get RC_KEXT_BLOCKED result.
+	# If RC_KEXT_BLOCKED encountered - services will be stopped on deploy finish, to allow handle this error by user
+	# on next PD start.
+	# If turned out that services should be running in "launchd mode" - services will be restarted on deploy finish
+
+	if [ $pd_ver -ge 14 ]; then
+		# Start services as NON-launchd mode
+		"${PRL_SERVICE_RUNNER}" service_start || srv_start_rc=$?
+	else
+		# Start launcher only if supported (PD8 and later)
+		[ -f "$LAUNCHER" ] || return 0
+
+		if [ $pd_ver -ge 12 ]; then
+			# Since PD12 launchd options are set/unset by dispatcher automatically and applied on its stop.
+			# We have to disable dispatcher's start as a service to handle KEXTS_LOADING_IS_BLOCKED_BY_OSX usecase properly.
+
+			if "${LAUNCHD_SETUP}" need_to_start_as_service; then
+				"${LAUNCHD_SETUP}" remove_plist || \
+					Abort "Unable to disable start PD as a service"
+				Log "Start PD as a service has been disabled temporarily."
+			fi
+		fi
+
+		DoLauncherOp start || srv_start_rc=$?
+	fi
+
+	local -r RC_KEXT_BLOCKED=9
+	if [ $srv_start_rc -ne 0 ]; then
+		if [ ${srv_start_rc} -eq ${RC_KEXT_BLOCKED} ]; then
+			Log "Kexts start is blocked by macOS, but lets continue setup"
+			KEXTS_LOADING_IS_BLOCKED_BY_OSX=1
+		else
+			Abort "Unable to start all Parallels Desktop services. Error $srv_start_rc"
+		fi
+	fi
+
+	Log "Path: $PATH"
+	Log "Waiting for Parallels Desktop services"
+	local -r CONNECT_MAX_COUNT=30
+	local out=""
+	local i
+	local srv_rc=0
+	for ((i=0; i<=$CONNECT_MAX_COUNT; i++)); do
+		srv_rc=0
+		out=$( "${PRLSRVCTL}" info 2>&1) || srv_rc=$?
+		if [ $srv_rc -eq 0 ]; then
+			Log "Parallels Desktop services are ready."
+			return 0
+		fi
+
+		sleep 1
+	done
+
+	Abort "Failed to start Parallels Desktop services, last try output: $out"
+}
+
+StopServices() {
+	local -r pd_ver="$(get_pd_version)"
+
+	if [ $pd_ver -ge 14 ]; then
+		"${PRL_SERVICE_RUNNER}" service_stop
+	else
+		# Start launcher only if supported (PD8 and later)
+		[ -f "$LAUNCHER" ] || return 0
+
+		DoLauncherOp stop
+	fi
+}
+
+ApplyLaunchOptions() {
+	local start_pd_as_service; start_pd_as_service="$(get_cfg_var start_pd_as_service)" || return 0 # nothing to apply
+
+	local -r pd_ver="$(get_pd_version)"
+	if [ $pd_ver -ge 12 ]; then
+		Log "Options to start PD as a services are skipped since PD12. They are set automatically."
+		return 0
+	fi
+
+	is_launchd_setup_exists "${SBA_INSTALL_PATH}" || \
+		Abort "Unable to install Paralles Desktop as a service. This version of the product does not support this feature."
+
+	if [[ "X${start_pd_as_service}" == "Xyes" ]]; then
+		"${LAUNCHD_SETUP}" install --force || \
+			Abort "Unable to install Paralles Desktop as a service."
+	elif [[ "X${start_pd_as_service}" == "Xno" ]]; then
+		# Uninstall only if launchd mode enabled
+		if "${LAUNCHD_SETUP}" need_to_start_as_service; then
+			"${LAUNCHD_SETUP}" uninstall || \
+				Abort "Unable to uninstall Paralles Desktop as a service."
+		fi
+	else
+		Abort "Wrong value of option 'start_pd_as_service' (='${start_pd_as_service}')."
+	fi
+}
+
+final_services_restart() {
+	[ $check_final_services_start_mode -eq 1 ] || return 0
+
+	check_final_services_start_mode=0
+
+	local -r pd_ver="$(get_pd_version)"
+	if [ $pd_ver -lt 12 ]; then
+		return 0
+	fi
+
+	# We started services as NON-launchd mode, so we should stop services because :
+	# 1. If services are not configured to run as "launchd mode", no need to leave them running
+	# 2. If services are configured to run as "launchd mode", "launchd mode" will be applied on services stop
+	# 3. If manual interaction required (for example KEXTS_LOADING_IS_BLOCKED_BY_OSX), stop services
+	#    and allow user manually handle the case
+
+	if [ ${KEXTS_LOADING_IS_BLOCKED_BY_OSX} -eq 1 ]; then
+		Log "A manual action required to allow kexts loading. Will stop services."
+		if [ -f "$LAUNCHD_PLIST" ]; then
+			Log "Disable to restart PD as a service due to kexts loading problems."
+			rm -f "$LAUNCHD_PLIST" || \
+				Abort "Unable to disable start PD as a service"
+		fi
+	fi
+
+	StopServices || \
+		Abort "Unable to stop services"
+
+	[ ${KEXTS_LOADING_IS_BLOCKED_BY_OSX} -ne 1 ] || \
+		Log "WARNING: A manual action required. To continue need to start Parallels Desktop.app and follow instructions."
+}
+
+
+#
+# Start actions
+#
+
+# Check user
+CheckUser
+
+# Check package
+CheckPackage
+
+# Check that deploy config file exists and validate it
+CheckConfigFile
+
+# Get VM for deploy list
+fill_vm_list_from_cfg
+
+# Get license key, offline confirmation
+GetLicense
+
+# Install Parallels Desktop application
+InstallApplication
+
+# Locate CLI tools used to configure installation params
+find_prl_ctl_tools
+
+# Configure application start parameters
+ApplyLaunchOptions
+
+# Installation logic is complex, ensure that services are started.
+StartServices
+
+prlsrvctl_disable_require_password_to_options
+
+prlsrvctl_hide_license_request_params
+
+InstallLicense "${license_key}" "${license_offline_confirmation_id}"
+
+prlsrvctl_apply_single_application_mode_options
+
+prlsrvctl_apply_cep_participation_option
+
+prlsrvctl_apply_screenshots_option
+
+DeployVMs
+
+prlsrvctl_apply_require_admin_password_to_options
+
+prlsrvctl_apply_require_password_to_options
+
+prlsrvctl_enable_require_password_to_options
+
+apply_per_user_options
+
+UpdateLicense
+
+# Prepare Services for stop/restart, if required
+final_services_restart

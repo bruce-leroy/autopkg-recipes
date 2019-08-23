@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# Install the license file
+LICENSE="/Applications/EndNote X9/.license.dat"
+CWYW_W="/Applications/EndNote X9/Cite While You Write/EndNote CWYW Word 2016.bundle"
+CWYW_P="/Applications/EndNote X9/Cite While You Write/PagesEndNote.bundle"
+CWYW_W_HOME="/Library/Application Support/Microsoft/Office365/User Content.localized/Startup.localized/Word"
+CWYW_P_HOME="/Library/ResearchSoft/EndNote/Plugins"
+cat << EOF > "${LICENSE}"
+Registered User
+NIH
+3091999568
+V2ZBHTL556P8WMUWTMTQ6YSM9XJCCRYQ59MENAX9479PMWFCT6894MV98CWMMH5C9AVL8TYQUM9RR9YX3RHM3ENAX9479CCWFCT6894ML98CWMMH5CCAVL8TYQUM6RR9YX3RH9GENAX9479PWWFCT6894MF98CWMMH5CUAVL8TYQUMSRR9YX3RHMXENAX9479PNWFCT6894MK98CWMMH5C6AVL8TYQUMJRR9YX3RHM4ENAX9479PJWFCT6894B698CWMMH5
+EOF
+
+
+chown root:admin "${LICENSE}"
+chmod 775 "${LICENSE}"
+
+# make the cwyw paths
+mkdir -p "${CWYW_P_HOME}"
+mkdir -p "${CWYW_W_HOME}"
+
+
+#Install CWYW for Word and Pages
+cp -pur "${CWYW_W}" "${CWYW_W_HOME}"
+cp -pur "${CWYW_P}" "${CWYW_P_HOME}"
+
+#Removing older versions
+
+
+find /Applications -name "EndNote [5-9]" -maxdepth 1 -exec rm -rf {} \;
+find /Applications -name "EndNote X" -maxdepth 1 -exec rm -rf {} \;
+find /Applications -name "EndNote X[1-8]" -maxdepth 1 -exec rm -rf {} \;

@@ -3,35 +3,26 @@
 <plist version="1.0">
 <dict>
     <key>Description</key>
-    <string>Downloads latest Firefox ESR disk image and builds a package.</string>
+    <string>Downloads latest Google Chrome disk image and builds a package. The installer package includes a preinstall script that will check for an existing Google Chrome.app in /Applications and remove it if found.</string>
     <key>Identifier</key>
-    <string>com.github.bruce-leroy.pkg.FirefoxESR</string>
+    <string>com.github.bruce-leroy.pkg.googlechrome</string>
     <key>Input</key>
     <dict>
         <key>NAME</key>
-        <string>FirefoxESR</string>
+        <string>GoogleChrome</string>
     </dict>
-    <key>MinimumVersion</key>
-    <string>0.6.0</string>
     <key>ParentRecipe</key>
-    <string>com.github.bruce-leroy.download.FirefoxESR</string>
+    <string>com.github.autopkg.download.googlechrome</string>
     <key>Process</key>
     <array>
         <dict>
+            <key>Processor</key>
+            <string>AppDmgVersioner</string>
             <key>Arguments</key>
             <dict>
-                <key>info_path</key>
-                <string>%pathname%/Firefox.app/Contents/Info.plist</string>
-                <key>plist_keys</key>
-                <dict>
-                    <key>CFBundleShortVersionString</key>
-                    <string>version</string>
-                    <key>CFBundleIdentifier</key>
-                    <string>bundleid</string>
-                </dict>
+                <key>dmg_path</key>
+                <string>%pathname%</string>
             </dict>
-            <key>Processor</key>
-            <string>PlistReader</string>
         </dict>
         <dict>
             <key>Processor</key>
@@ -53,9 +44,9 @@
             <key>Arguments</key>
             <dict>
                 <key>source_path</key>
-                <string>%pathname%/Firefox.app</string>
+                <string>%pathname%/%app_name%</string>
                 <key>destination_path</key>
-                <string>%pkgroot%/Applications/Firefox.app</string>
+                <string>%pkgroot%/Applications/%app_name%</string>
             </dict>
         </dict>
         <dict>
@@ -71,8 +62,10 @@
                     <string>%version%</string>
                     <key>id</key>
                     <string>%bundleid%</string>
-                     <key>options</key>
+                    <key>options</key>
                     <string>purge_ds_store</string>
+                    <key>scripts</key>
+                    <string>Scripts</string>
                     <key>chown</key>
                     <array>
                         <dict>

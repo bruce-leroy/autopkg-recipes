@@ -1,0 +1,5 @@
+#!/bin/sh
+
+# Change permissions so everyone can write to it Chrome
+
+chmod -R 777 "/Applications/Google Chrome.app"

@@ -3,15 +3,15 @@
 <plist version="1.0">
 <dict>
 	<key>Description</key>
-	<string>Downloads the latest version of EndNote X9</string>
+	<string>Downloads the current release version of MacVector.</string>
 	<key>Identifier</key>
-	<string>com.github.bruce-leroy.download.EndNoteX9</string>
+	<string>com.github.bruce-leroy.download.MacVector</string>
 	<key>Input</key>
 	<dict>
-		<key>DOWNLOAD_URL</key>
-		<string>http://download.endnote.com/downloads/X9/EndNoteX9Installer.dmg</string>
 		<key>NAME</key>
-		<string>EndNoteX9</string>
+		<string>MacVector</string>
+		<key>DOWNLOAD_URL</key>
+		<string>https://macvector.net/MacVector17.0.3(34).dmg</string>
 	</dict>
 	<key>MinimumVersion</key>
 	<string>1.0.0</string>
@@ -21,7 +21,7 @@
 			<key>Arguments</key>
 			<dict>
 				<key>filename</key>
-				<string>%NAME%.dmg</string>
+				<string>MacVector17.0.3(34).dmg</string>
 				<key>url</key>
 				<string>%DOWNLOAD_URL%</string>
 			</dict>
@@ -35,10 +35,10 @@
 		<dict>
 			<key>Arguments</key>
 			<dict>
-				<key>input_plist_path</key>
-				<string>%pathname%/Install EndNote X9.app/Contents/Info.plist</string>
-				<key>plist_version_key</key>
-				<string>CFBundleShortVersionString</string>
+					<key>input_plist_path</key>
+					<string>%pathname%/%NAME%/MacVector.app/Contents/Info.plist</string>
+					<key>plist_version_key</key>
+					<string>CFBundleShortVersionTring</string>
 			</dict>
 			<key>Processor</key>
 			<string>Versioner</string>
@@ -49,9 +49,11 @@
 			<key>Arguments</key>
 			<dict>
 				<key>input_path</key>
-				<string>%pathname%/Install EndNote X9.app</string>
+				<string>%RECIPE_CACHE_DIR%/%NAME%/MacVector.app</string>
 				<key>requirement</key>
-				<string>anchor apple generic and identifier "com.endnote.installEndNote" and (certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "2Y4P62NL52")</string>
+				<string>anchor apple generic and identifier "com.macvector.MacVector" and (certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = BK85R8X44N)</string>
+				<key>strict_verification</key>
+				<true />
 			</dict>
 		</dict>
 	</array>
